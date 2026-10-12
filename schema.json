@@ -46,6 +46,16 @@
         "default": false,
         "hint": "开启后按下方间隔自动检查并推送，默认关"
       },
+      "push_mode": {
+        "type": "string",
+        "name": "推送方式",
+        "options": [
+          "bot",
+          "raw"
+        ],
+        "default": "bot",
+        "hint": "bot=把情报作为系统消息交给 AI，让它用自己的口吻播报（推荐）；raw=不经过 AI，直接把原文投递到目标会话"
+      },
       "check_interval": {
         "type": "integer",
         "name": "自动检查间隔秒",

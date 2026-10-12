@@ -25,17 +25,20 @@ v1.0.1 变更（兼容 + 稳定性，功能语义不变）
 from __future__ import annotations
 
 import asyncio
+import html as _html
+import inspect
 import json
 import re
 import time
+import urllib.parse
 import urllib.request
 from pathlib import Path
 from typing import List, Optional
 
 from core.plugin import BasePlugin, logger, on, Priority, register
-from core.chat import MessageChain
+from core.chat import MessageChain, User, Group
 from core.chat.message_elements import Text
-from core.chat.message_utils import KiraMessageEvent, KiraMessageBatchEvent
+from core.chat.message_utils import KiraMessageEvent, KiraMessageBatchEvent, KiraIMMessage
 from core.utils.path_utils import get_config_path
 
 PLUGIN_ID = "kiss_info_plugin"
@@ -55,6 +58,14 @@ SOURCES = {
 DEFAULT_COMMANDS = ["/kiss"]
 MAX_ITEMS_BRIEF = 5
 MAX_ITEMS_FULL = 12
+BODY_ITEMS_FULL = 3            # full 深度下，每源抓几篇正文摘要
+BODY_EXCERPT_CHARS = 400       # 单篇正文摘要上限（控 token）
+
+# bot 播报用的引导语：把情报交给模型，让它用自己的人设口吻说出来
+PUSH_PROMPT = (
+    "【系统定时检查】下面是 KISS 官网的最新情报，请你**用你自己的口吻**转述给这个会话里的人们"
+    "（日文标题可以顺手翻成中文、版本号与日期要点清楚，别照抄这段系统说明）：\n\n"
+)
 
 
 def _decode(raw: bytes, charset: Optional[str]) -> str:
@@ -112,7 +123,9 @@ def _parse_news(html: Optional[str]) -> List[dict]:
         r'<table class="blog_frame_top">.*?<th[^>]*>([^<]+)</th>.*?<td[^>]*>.*?<a[^>]*href="([^"]*)"[^>]*>([^<]+)</a>',
         html, re.S | re.I,
     ):
-        date_raw, href, title = m.group(1).strip(), m.group(2).strip(), m.group(3).strip()
+        date_raw = m.group(1).strip()
+        href = m.group(2).strip()
+        title = _html.unescape(m.group(3)).strip()     # 页面里会有 &amp; 之类实体
         dm = re.search(r"(\d{4})年(\d{1,2})月(\d{1,2})日", date_raw)
         if dm:
             y, mo, d = dm.groups()
@@ -127,7 +140,8 @@ def _parse_news(html: Optional[str]) -> List[dict]:
         r'<table class="blog_frame_top">.*?<th[^>]*>([^<]+)</th>.*?<td[^>]*>.*?<a[^>]*>([^<]+)</a>',
         html, re.S | re.I,
     ):
-        date_raw, title = m.group(1).strip(), m.group(2).strip()
+        date_raw = m.group(1).strip()
+        title = _html.unescape(m.group(2)).strip()
         dm = re.search(r"(\d{4})年(\d{1,2})月(\d{1,2})日", date_raw)
         date = f"{dm.group(1)}-{dm.group(2).zfill(2)}-{dm.group(3).zfill(2)}" if dm else date_raw
         items.append({"date": date, "title": title})
@@ -155,9 +169,75 @@ def _fetch_source(key: str, timeout: int) -> dict:
         return {"source": key, "name": src["name"], "error": "抓取失败"}
     if src["type"] == "update":
         return {"source": key, "name": src["name"], **_parse_update(html)}
-    if key == "crc3d":
-        return {"source": key, "name": src["name"], "items": _parse_crc3d(html)}
-    return {"source": key, "name": src["name"], "items": _parse_news(html)}
+    items = _parse_crc3d(html) if key == "crc3d" else _parse_news(html)
+    for it in items:                      # 站内相对链接 → 绝对地址（展示即可点）
+        if it.get("link"):
+            it["link"] = _abs_url(it["link"], src["url"])
+    return {"source": key, "name": src["name"], "items": items}
+
+
+def _strip_tags(raw: str) -> str:
+    """粗剥 HTML：去脚本/样式、去标签、反转义实体、压缩空白。"""
+    s = re.sub(r"(?is)<(script|style)[^>]*>.*?</\1>", " ", raw or "")
+    s = re.sub(r"(?s)<[^>]+>", " ", s)
+    s = _html.unescape(s).replace("\xa0", " ")
+    return re.sub(r"\s+", " ", s).strip()
+
+
+def _abs_url(link: str, base: str = "") -> str:
+    """把站内相对链接拼成绝对地址（博客页给的是 ./diary.php?no=…）。"""
+    link = (link or "").strip()
+    if not link:
+        return ""
+    if link.startswith("http"):
+        return link
+    if link.startswith("//"):
+        return "https:" + link
+    return urllib.parse.urljoin(base or "https://www.kisskiss.tv/kiss/diary.php", link)
+
+
+def _meta_description(raw: str) -> str:
+    """文章页自带的摘要（twitter:description / og:description / description），最干净。"""
+    for m in re.finditer(r"<meta\b[^>]*>", raw or "", re.I):
+        tag = m.group(0)
+        if not re.search(r'(?:name|property)=["\'](?:twitter:description|og:description|description)["\']',
+                         tag, re.I):
+            continue
+        c = re.search(r'content=["\'](.*?)["\']', tag, re.S | re.I)
+        if c:
+            txt = re.sub(r"\s+", " ", _html.unescape(c.group(1))).strip()
+            if len(txt) >= 40:
+                return txt
+    return ""
+
+
+def _extract_article_text(raw: str, limit: int = BODY_EXCERPT_CHARS) -> str:
+    """取文章正文摘要：优先站点自带 meta 摘要 → blog_data 正文容器 → 整页剥标签兜底。
+
+    （直接剥整页会带上一大串导航菜单，所以按优先级来；实在取不到才退回最后一档。）
+    """
+    if not raw:
+        return ""
+    text = _meta_description(raw)
+    if not text:
+        m = re.search(r'<div class="blog_data"[^>]*>(.*?)</div>\s*</div>', raw, re.S | re.I)
+        if not m:
+            m = re.search(r'<div class="blog_data"[^>]*>(.*)', raw, re.S | re.I)
+        text = _strip_tags(m.group(1) if m else raw)
+    if len(text) <= limit:
+        return text
+    return text[:limit].rstrip() + "…"
+
+
+def _fetch_item_text(link: str, base: str = "", limit: int = BODY_EXCERPT_CHARS) -> str:
+    """抓一篇文章正文并截断成摘要（同步，调用方走线程池；失败返回空串）。"""
+    url = _abs_url(link, base)
+    if not url:
+        return ""
+    html = _fetch(url, 8)
+    if not html:
+        return ""
+    return _extract_article_text(html, limit)
 
 
 def _fingerprint(data: dict) -> str:
@@ -192,6 +272,8 @@ def _format(data: dict, depth: str = "brief") -> str:
             line = f"- {date} {title}".rstrip()
             if full and it.get("link"):
                 line += f"\n  {it['link']}"
+            if full and it.get("excerpt"):
+                line += f"\n  {it['excerpt']}"
             lines.append(line)
         if len(items) > limit:
             lines.append(f"…还有 {len(items) - limit} 条，想看更多可以直接翻官网")
@@ -210,6 +292,8 @@ class KissInfoPlugin(BasePlugin):
         self.auto_check = bool(sec.get("auto_check", False))
         self.check_interval = int(sec.get("check_interval", 86400))
         self.push_targets = self._as_list(sec.get("push_targets", []))
+        mode = str(sec.get("push_mode", "bot") or "bot").strip().lower()
+        self.push_mode = mode if mode in ("bot", "raw") else "bot"   # bot=让 AI 用自己的口吻说；raw=机械投递原文
         srcs = cfg.get("section_sources", {})
         self.source_keys = [k for k in SOURCES if bool(srcs.get(f"src_{k}", True))]
         self.commands = self._as_list(sec.get("commands", DEFAULT_COMMANDS)) or list(DEFAULT_COMMANDS)
@@ -287,11 +371,92 @@ class KissInfoPlugin(BasePlugin):
                 return
 
     async def _push(self, text: str):
+        """按 push_mode 推送：bot=构造系统消息让 AI 用自己的口吻播报；raw=直接投递原文。"""
         for target in list(self.push_targets):
             try:
-                await self.ctx.send_message_chain(target, MessageChain([Text(text)]))
+                if self.push_mode == "raw":
+                    await self.ctx.send_message_chain(target, MessageChain([Text(text)]))
+                    continue
+                ok = await self._push_as_event(target, text)
+                if not ok:
+                    # 事件注入不可用（适配器缺失等）⇒ 退回机械投递，情报不能丢
+                    logger.warning(f"[kiss-info] {target} 无法让 bot 播报，改为直接投递原文")
+                    await self.ctx.send_message_chain(target, MessageChain([Text(text)]))
             except Exception as e:
                 logger.warning(f"[kiss-info] 推送到 {target} 失败: {e}")
+
+    async def _push_as_event(self, target: str, content: str) -> bool:
+        """构造一条「系统消息」注入消息管线，让 AI 以自己的人格口吻播报（双世代）。
+
+        与 hotnews 插件同一套做法：KiraIMMessage(is_notice/is_mentioned) + KiraMessageEvent，
+        `event.trigger(force=True)` 跳过 discard 策略，再 publish 到事件总线
+        （两代 lifecycle 都把 KiraMessageEvent 订阅到各自的消息管线）。
+        """
+        parts = (target or "").split(":")
+        if len(parts) != 3:
+            logger.warning(f"[kiss-info] 推送目标格式应为 adapter:gm|dm:id：{target}")
+            return False
+        ada_name, st, sid = parts
+        ada = self.ctx.adapter_mgr.get_adapter(ada_name)
+        if ada is None:
+            return False
+        prompt = PUSH_PROMPT + content
+        chain = MessageChain([Text(prompt)])
+        now = int(time.time())
+        self_id = None
+        try:
+            cfg = getattr(ada, "config", None)
+            self_id = cfg.get("self_id") if hasattr(cfg, "get") else None
+        except Exception:
+            self_id = None
+        msg = KiraIMMessage(
+            timestamp=now,
+            sender=User(user_id=sid if st == "dm" else "unknown", nickname="系统"),
+            group=Group(group_id=sid) if st == "gm" else None,
+            message_id=f"kiss_sys_push_{now}",
+            self_id=self_id,
+            is_notice=True,
+            is_mentioned=True,
+            chain=chain,
+        )
+        msg.message_str = prompt          # 不补这两个字段，AI 侧会看到空内容
+        msg.message_repr = " ".join(str(getattr(e, "repr", "")) for e in chain)
+        event = await self._make_event(ada, msg, now)
+        event.trigger(force=True)
+        await self.ctx.event_bus.publish(event)
+        logger.info(f"[kiss-info] 情报已注入消息管线，交由 bot 播报 → {target}")
+        return True
+
+    async def _adapter_elements(self, adapter) -> list:
+        """取适配器可输出元素清单（双世代：3.0 能力元数据 → 2.x message_types）。"""
+        try:
+            from core.adapter import IMCapability       # 3.0 能力架构才有
+        except ImportError:
+            IMCapability = None
+        try:
+            get_cap = getattr(adapter, "get_capability", None)
+            if IMCapability is not None and get_cap is not None:
+                im = get_cap(IMCapability)
+                if im is not None:
+                    meta = im.get_message_metadata()
+                    meta = await meta if inspect.isawaitable(meta) else meta
+                    elems = getattr(meta, "supported_elements", None)
+                    if elems is not None:
+                        return list(elems)
+        except Exception:
+            pass
+        return list(getattr(adapter, "message_types", []) or [])
+
+    async def _make_event(self, adapter, msg, ts) -> KiraMessageEvent:
+        """构造事件：3.0 字段名是 supported_elements，2.x 是 message_types（按签名实测分流）。"""
+        elements = await self._adapter_elements(adapter)
+        try:
+            params = set(inspect.signature(KiraMessageEvent.__init__).parameters)
+        except Exception:
+            params = {"message_types"}
+        kw = ({"supported_elements": elements} if "supported_elements" in params
+              else {"message_types": elements})
+        return KiraMessageEvent(adapter=adapter.info, message=msg, timestamp=ts, **kw)
 
     # ==================== 缓存 ====================
 
@@ -363,8 +528,11 @@ class KissInfoPlugin(BasePlugin):
         name="kiss_info_query",
         description=(
             "查询 KISS 官方情报：COM3D2/CM3D2/CRC3D/CR EditSystem 的最新版本号、更新日期、"
-            "官方公告、活动、DLC 情况。命中缓存直接返回（零 token 秒回），想看最新可传 "
-            "force=true 强制重新抓取。返回结构化文本，你需要把日文标题翻译成中文展示给用户。"
+            "官方公告、活动、DLC。可用参数做定向查询：month=YYYYMM 查某月博客归档、"
+            "source=数据源（cm3d2/com3d2/crc3d/cres/news/dlc_shop 或其中文名）只看某一源、"
+            "keyword=关键词按标题过滤、depth=full 时附带正文摘要与原文链接。"
+            "默认命中缓存零 token 秒回；想看最新传 force=true 强制重抓。"
+            "返回结构化文本，你负责把日文标题翻译成中文再讲给用户。"
         ),
         params={
             "type": "object",
@@ -377,29 +545,105 @@ class KissInfoPlugin(BasePlugin):
                 "depth": {
                     "type": "string",
                     "enum": ["brief", "full"],
-                    "description": "内容深度：brief=只版本号/标题，full=含更多条目与原文链接",
+                    "description": "brief=只版本号/标题；full=更多条目 + 原文链接 + 正文摘要",
+                },
+                "month": {
+                    "type": "string",
+                    "description": "查历史归档，格式 YYYYMM（如 202608）。给了它就只查这个月的公告",
+                },
+                "source": {
+                    "type": "string",
+                    "description": "只看某个数据源，如 com3d2 / news / dlc_shop，也认中文名（COM3D2、KISS公告、DLC商店）",
+                },
+                "keyword": {
+                    "type": "string",
+                    "description": "按标题关键词过滤（日文原文匹配），如 アップデート、DLC、発売",
                 },
             },
         },
     )
-    async def tool_query(self, event: KiraMessageBatchEvent, force: bool = False, depth: str = "") -> str:
+    async def tool_query(self, event: KiraMessageBatchEvent, force: bool = False, depth: str = "",
+                        month: str = "", source: str = "", keyword: str = "") -> str:
         if not self.enabled:
             return "KISS 官方情报插件未启用"
         if not self.enable_llm_tool:
             return "KISS 官方情报的 LLM 工具已关闭（可在插件配置中开启）"
         eff_depth = depth if depth in ("brief", "full") else self.content_depth
+        kw = (keyword or "").strip().lower()
         try:
-            if force:
-                changes, errors = await self._check_all(force=True)
-                data = changes + errors
-            else:
-                data = await self._check_cached()
+            # —— 历史归档：只查这一个月的公告 ——
+            if (month or "").strip():
+                m = month.strip()
+                if not re.fullmatch(r"\d{6}", m):
+                    return "month 格式要 YYYYMM，例如 202608"
+                items = await self._fetch_month(m)
+                if kw:
+                    items = [i for i in items if kw in (i.get("title") or "").lower()]
+                if not items:
+                    return f"{m} 没抓到公告（可能月份太早、页面结构变了，或该关键词无匹配）"
+                data = [{"name": f"KISS公告 {m}", "items": items}]
+                if eff_depth == "full":
+                    await self._attach_bodies(data)
+                return "\n".join(_format(d, eff_depth) for d in data)
+
+            data = await self._cached_or_fetch(force)
+
+            # —— 指定数据源 ——
+            if (source or "").strip():
+                want = source.strip().lower()
+                picked = [d for d in data
+                          if want == (d.get("source") or "").lower()
+                          or want == (d.get("name") or "").lower()
+                          or want in (d.get("name") or "").lower()]
+                if not picked:
+                    names = "、".join(f"{k}（{SOURCES[k]['name']}）" for k in self.source_keys)
+                    return f"没有叫「{source}」的数据源，可选：{names}"
+                data = picked
+
+            # —— 关键词过滤（只对列表类源生效）——
+            if kw:
+                filtered = []
+                for d in data:
+                    if "items" not in d:
+                        continue
+                    hit = [i for i in (d.get("items") or []) if kw in (i.get("title") or "").lower()]
+                    if hit:
+                        filtered.append({**d, "items": hit})
+                if not filtered:
+                    return f"没有标题包含「{keyword}」的条目（可换关键词，或去掉 keyword 看全部）"
+                data = filtered
+
             if not data:
                 return "KISS 各源暂无数据"
+            if eff_depth == "full":
+                await self._attach_bodies(data)
             return "\n".join(_format(d, eff_depth) for d in data)
         except Exception as e:
             logger.exception("[kiss-info] 工具调用失败")
             return f"KISS 官方情报查询失败：{e}"
+
+    async def _cached_or_fetch(self, force: bool):
+        if force:
+            changes, errors = await self._check_all(force=True)
+            return changes + errors
+        return await self._check_cached()
+
+    async def _attach_bodies(self, data: list):
+        """full 深度：给每个列表源的最新几篇抓正文摘要（并发 + 限流，控 token）。"""
+        targets = []
+        for d in data:
+            for it in (d.get("items") or [])[:BODY_ITEMS_FULL]:
+                if it.get("link") and not it.get("excerpt"):
+                    targets.append(it)
+        if not targets:
+            return
+        texts = await asyncio.gather(
+            *[asyncio.to_thread(_fetch_item_text, it.get("link") or "",
+                                it.get("_base") or "") for it in targets]
+        )
+        for it, txt in zip(targets, texts):
+            if txt:
+                it["excerpt"] = txt
 
     # ==================== 命令 ====================
 
