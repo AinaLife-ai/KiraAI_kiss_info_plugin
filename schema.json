@@ -56,6 +56,12 @@
         "default": "bot",
         "hint": "bot=把情报作为系统消息交给 AI，让它用自己的口吻播报（推荐）；raw=不经过 AI，直接把原文投递到目标会话"
       },
+      "push_also_raw": {
+        "type": "switch",
+        "name": "同时机械投递原文",
+        "default": false,
+        "hint": "开启后，除了让 AI 用自己的口吻播报，还会**同时**把整理好的原文直接投递一份到目标会话（两种都发，互不替代）。仅在「推送方式 = bot」时有效；选 raw 时本来就发原文，无需开启。"
+      },
       "check_interval": {
         "type": "integer",
         "name": "自动检查间隔秒",

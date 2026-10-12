@@ -299,6 +299,7 @@ class KissInfoPlugin(BasePlugin):
         self.push_targets = self._as_list(sec.get("push_targets", []))
         mode = str(sec.get("push_mode", "bot") or "bot").strip().lower()
         self.push_mode = mode if mode in ("bot", "raw") else "bot"   # bot=让 AI 用自己的口吻说；raw=机械投递原文
+        self.push_also_raw = bool(sec.get("push_also_raw", False))   # 允许两种方式同时发（先落原文，再让 bot 播报）
         srcs = cfg.get("section_sources", {})
         self.source_keys = [k for k in SOURCES if bool(srcs.get(f"src_{k}", True))]
         self.commands = self._as_list(sec.get("commands", DEFAULT_COMMANDS)) or list(DEFAULT_COMMANDS)
@@ -320,7 +321,8 @@ class KissInfoPlugin(BasePlugin):
         logger.info(
             f"[kiss-info] KISS 官方情报插件加载完成 v1.0.1 "
             f"(llm_tool={self.enable_llm_tool} cmd={self.enable_command} "
-            f"auto_check={self.auto_check} depth={self.content_depth} "
+            f"auto_check={self.auto_check} push_mode={self.push_mode}"
+            f"{'+raw' if self.push_also_raw else ''} depth={self.content_depth} "
             f"sources={self.source_keys} push={self.push_targets})"
         )
         self._sync_auto_task()
@@ -376,17 +378,25 @@ class KissInfoPlugin(BasePlugin):
                 return
 
     async def _push(self, text: str):
-        """按 push_mode 推送：bot=构造系统消息让 AI 用自己的口吻播报；raw=直接投递原文。"""
+        """按配置推送：
+
+        · `push_mode=bot`：构造系统消息注入管线，让 AI **用自己的口吻**播报；
+        · `push_mode=raw`：不经过 AI，直接投递整理好的原文；
+        · `push_also_raw=true`：两者**同时启用** —— 先落一份原文，再让 bot 播报
+          （原文与 bot 的播报各一份，互不替代；`push_mode=raw` 时该开关无效果，只发一次）。
+        """
         for target in list(self.push_targets):
+            raw_sent = False
             try:
-                if self.push_mode == "raw":
+                if self.push_mode == "raw" or self.push_also_raw:
                     await self.ctx.send_message_chain(target, MessageChain([Text(text)]))
-                    continue
-                ok = await self._push_as_event(target, text)
-                if not ok:
-                    # 事件注入不可用（适配器缺失等）⇒ 退回机械投递，情报不能丢
-                    logger.warning(f"[kiss-info] {target} 无法让 bot 播报，改为直接投递原文")
-                    await self.ctx.send_message_chain(target, MessageChain([Text(text)]))
+                    raw_sent = True
+                if self.push_mode == "bot":
+                    ok = await self._push_as_event(target, text)
+                    if not ok and not raw_sent:
+                        # 事件注入不可用（适配器缺失等）⇒ 退回机械投递，情报不能丢
+                        logger.warning(f"[kiss-info] {target} 无法让 bot 播报，改为直接投递原文")
+                        await self.ctx.send_message_chain(target, MessageChain([Text(text)]))
             except Exception as e:
                 logger.warning(f"[kiss-info] 推送到 {target} 失败: {e}")
 
