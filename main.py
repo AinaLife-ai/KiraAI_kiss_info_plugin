@@ -249,7 +249,11 @@ def _fingerprint(data: dict) -> str:
 
 
 def _format(data: dict, depth: str = "brief") -> str:
-    """把结构化结果格式化成可读文本。brief 只给版本号/标题；full 给更多条目与链接。"""
+    """把结构化结果格式化成可读文本。
+
+    brief：版本号 / 标题 + 原文链接（链接用于查证与引用，两种深度都给）；
+    full ：条目更多（12 条）+ 每源最新几篇的正文摘要。
+    """
     full = depth == "full"
     if "error" in data:
         return f"[{data.get('name')}] {data['error']}"
@@ -270,8 +274,9 @@ def _format(data: dict, depth: str = "brief") -> str:
             date = it.get("date") or ""
             title = it.get("title") or ""
             line = f"- {date} {title}".rstrip()
-            if full and it.get("link"):
-                line += f"\n  {it['link']}"
+            if it.get("link"):
+                # 链接在 brief/full 都给：bot 可以据此查证、引用或让用户直接点开
+                line += f" → {it['link']}"
             if full and it.get("excerpt"):
                 line += f"\n  {it['excerpt']}"
             lines.append(line)
